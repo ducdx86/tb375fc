@@ -1,0 +1,949 @@
+// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+/*
+ * Lenovo TB375FC（MT6897 / MT8792）—— mainline S1 board DTS。
+ *
+ * S1 的目标只有一个：主线内核跑起来，并且**在屏幕上**看到内核日志。
+ * 这台机器没有可用的串口调试口（UART0 走键盘底座），fbcon 是唯一出口。
+ *
+ * 关键事实（来源：reports/porting-facts.md，取自 bootloader 传入的 FDT 与 LK 日志）：
+ *   - 帧缓冲 0xfc16f000，64 MB（LK 的 mblock-alloc + atag,videolfb 两处一致）
+ *   - 面板 2944x1840，bpp=4 → stride 11776
+ *   - /memory 起点 0x40000000，12 GB
+ *   - GIC 0xc000000 + 重分发 0xc400000；BL31 常驻 0x48800000（2 MB，必须保留，
+ *     否则 PSCI（secondary boot / cpuidle）会踩到 ATF）
+ */
+
+/dts-v1/;
+#include "mt6897.dtsi"
+
+/ {
+	model = "Lenovo TB375FC";
+	compatible = "lenovo,tb375fc", "mediatek,mt6897";
+
+	chosen {
+		/*
+		 * LK 会用自己那份 cmdline 覆写 /chosen，所以这条实际多半不生效 ——
+		 * 内核那边用 CONFIG_CMDLINE_FORCE 兜底（见 configs/tb375fc-s1.config）。
+		 */
+		/*
+		 * panic=0 —— **panic 后不重启**，让画面停在死掉那一刻。
+		 * 这是没有串口时最有效的调试手段：刷一次就能把现场读完。
+		 * （代价：需要长按电源键强制重启。）
+		 */
+		bootargs = "console=tty0 ignore_loglevel cpuidle.off=1 clk_ignore_unused panic=0 nt36xxx_ts.accept_unknown_chip=1";
+		stdout-path = &uart0;
+	};
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x0 0x40000000 0x3 0x0>;		/* 12 GiB */
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/*
+		 * ============================================================
+		 * connsys（WiFi / 蓝牙 / GNSS）EMI 内存 —— **我们自己补的**
+		 * ============================================================
+		 * 为什么必须自己留：
+		 *   conninfra/platform/emi_mng.c 把 ALLOCATE_CONNSYS_EMI_FROM_DTS
+		 *   写死为 1（第 39 行），取址顺序是
+		 *       1) consys 节点的 memory-region  ← 本文件下面两处
+		 *       2) 退而读 emi-addr / emi-size
+		 *   而**本机 LK 没往我们的 DTB 里注入 emi-addr**（live FDT 里
+		 *   consys 的 emi-addr = <0>）⇒ 只能走路径 1。
+		 *
+		 * ★ 地址不能自己挑，必须等于 LK 给厂商内核留的那一块。
+		 *   早前这里取 0x88000000 是**照 expdb 里那份静态 DTB 推的**，
+		 *   而静态 DTB 是 LK 打属性**之前**的版本，里面根本没有
+		 *   consys_emi_reserved ⇒ 推出来的"空窗口"是假的。
+		 *   真值取自 LK 自己的串口日志（reports/20260910-recovery/expdb_full.bin）：
+		 *
+		 *     [platform_load_connsys] Overall=0x2120000, connsys=0xc00000,
+		 *                             gps=0x100000, wfdma=0x1400000, scp-shm=0x20000
+		 *     mblock_alloc_range_no_lock: start: 0x8cc00000, sz: 0x2120000,
+		 *                             limit: 0x90000000, name:consys_emi_reserved
+		 *     [platform_load_connsys] mblock resize [34734080]->[13631488] ret=0
+		 *     [platform_load_connsys] overall_pa=8cc00000, gps_pa=8d800000,
+		 *                             wfdma_pa=8d900000, scp-scp_shm_pa=8ed00000
+		 *     [platform_load_connsys] EMI address: [connsys, md, gps]
+		 *                             = [0x8cc00000, 0x0, 0x8d800000]
+		 *     mblock-R[44] 0x8cc00000 size 0xd00000 consys_emi_reserved
+		 *     mblock-R[45] 0x8d900000 size 0x1400000 shared-dma-pool_wifi-reserve-memory_dma
+		 *
+		 *   同一份数据在 reports/20260910-panic/console-ramoops-0 的
+		 *   "OF: reserved mem:" 行里可交叉核对（厂商 6.1.138 内核视角）。
+		 *   布局是自洽的：connsys 0x8cc00000+0xc00000 = gps 0x8d800000，
+		 *   gps +0x100000 = wfdma 0x8d900000，wfdma +0x1400000 = 0x8ed00000。
+		 *   consys_emi_reserved 的 0xd00000 = connsys(0xc00000) + gps(0x100000)。
+		 *
+		 *   为什么基址必须一致：WF CPU 放开复位后跑的是它内部 ROM，ROM 通过
+		 *   CONN2AP 的 EMI remap 窗口（host_csr_top+0x354/0x35C/0x360、
+		 *   bus_cr+0x364..0x370）去固定物理基址找 patch；基址错 ⇒ ROM 读不到
+		 *   ⇒ ROMCODE_INDEX 永远是 0。
+		 *   ⚠️ 2026-09-19 更正：早前这里写「remap 寄存器 AP 写不进去、回读恒 0、
+		 *   由固件（LK/ATF）持有」——该结论**已死**。实测 connsys EMI 对 AP 可读可写
+		 *   （早前"写不进"是在 conn 域掉电时测到的毒值 0x00010002）；remap 写不进
+		 *   的真实原因是把寄存器块指错了（mt6895 克隆残留），现已在
+		 *   tools/patches/fix_mt6897_conninfra_pos_vendor_map.py 里改到
+		 *   conn_host_csr_top。地址 0x8cc00000/0xd00000 本身是对的（LK 串口日志 +
+		 *   厂商 ramoops 交叉验证），可保留；别再当成"固件已替我们装好"的证据。
+		 *
+		 * ⚠️ 消费者（两条，都已确认）：
+		 *   consys 节点 → conninfra emi_mng.c:159 of_parse_phandle(np,"memory-region",0)
+		 *   wifi   节点 → wlan_drv_gen4m/os/linux/hif/axi/axi.c:563
+		 *                （of_match = "mediatek,wifi"；它还额外读保留区节点的
+		 *                  "size" 属性，所以 wifi 那块显式写了 size）
+		 */
+		consys_reserved: consys-emi@8cc00000 {
+			reg = <0x0 0x8cc00000 0x0 0xd00000>;
+			no-map;
+			compatible = "mediatek,consys_emi_reserved";
+		};
+
+		wifi_reserved: wifi-emi@8d900000 {
+			reg = <0x0 0x8d900000 0x0 0x1400000>;
+			/* axi.c 的 axiGetRsvMemSizeRsvedByKernel() 用
+			 * `of_property_read_u64_array(np, "size", &sz, 1)` 读它 ——
+			 * **必须 8 字节（两个 cell）**，写成 <0x1400000> 只有 4 字节，
+			 * 会返回 -EOVERFLOW(-75)（2026-09-20 打开 DBGLOG 后实测到）。
+			 * 主路径失败后 axi.c 会退回读 wifi 节点的 `emi-size`，
+			 * 所以之前没暴露出来，但日志里会一直报错。
+			 */
+			size = <0x0 0x1400000>;
+			no-map;
+			compatible = "shared-dma-pool";
+		};
+
+		/* BL31 / ATF：PSCI 的落点，被 Linux 覆盖 = secondary CPU 或 suspend 挂死 */
+		bl31@48800000 {
+			reg = <0x0 0x48800000 0x0 0x200000>;
+			no-map;
+		};
+
+		/*
+		 * LK 留下的扫描输出缓冲。必须 no-map：否则它落在内核 RAM 里，
+		 * simplefb 的 request_mem_region()/ioremap() 会失败，而且内核可能
+		 * 把这块内存拿去用、把 LK 画面写坏。
+		 */
+		framebuffer@fc16f000 {
+			reg = <0x0 0xfc16f000 0x0 0x3e90000>;
+			no-map;
+		};
+
+		/*
+		 * MT6897 硬件/固件保留内存（直接提取自厂商 DTB board.dts）：
+		 * 必须精确 no-map，防止 Linux 将其当普通 RAM 申请并触碰，
+		 * 导致触发 EMI MPU 硬件安全违规、协处理器死锁或总线挂死。
+		 */
+		mblock-34-sspm_ap-shared {
+			reg = <0x0 0x9f06f000 0x0 0x110000>;
+			no-map;
+		};
+
+		mblock-33-platform-debug_slbc_shared {
+			reg = <0x0 0xfc12f000 0x0 0x40000>;
+			no-map;
+		};
+
+		mblock-32-me_GPUEB_SHARED {
+			reg = <0x0 0x7fe70000 0x0 0x180000>;
+			no-map;
+		};
+
+		mblock-31-me_CSFFWLOG_reserved {
+			reg = <0x0 0x7fffb000 0x0 0x4000>;
+			no-map;
+		};
+
+		mblock-30-me_vcp_reserved {
+			reg = <0x0 0xbf600000 0x0 0x800000>;
+			no-map;
+		};
+
+		mblock-29-debug_met_res-ram {
+			reg = <0x0 0x9f17f000 0x0 0xc00000>;
+			no-map;
+		};
+
+		mblock-28-platform-debug_dfdsoc_dump {
+			reg = <0x0 0xf9400000 0x0 0x300000>;
+			no-map;
+		};
+
+		mblock-27-security_tee_ree {
+			reg = <0x3 0x3b400000 0x0 0x2000000>;
+			no-map;
+		};
+
+		mblock-26-security_tee_log {
+			reg = <0x3 0x3d400000 0x0 0x20000>;
+			no-map;
+		};
+
+		mblock-25-tee-reserved {
+			reg = <0x0 0x70000000 0x0 0x5000000>;
+			no-map;
+		};
+
+		mblock-24-tee-secmem {
+			reg = <0x0 0x7f400000 0x0 0x900000>;
+			no-map;
+		};
+
+		mblock-23-MCUPM-reserved {
+			reg = <0x0 0x7fd00000 0x0 0x100000>;
+			no-map;
+		};
+
+		mblock-22-SSPM-reserved {
+			reg = <0x0 0x9fd7f000 0x0 0x280000>;
+			no-map;
+		};
+
+		mblock-21-platform_mtksmmu_protpgd {
+			reg = <0x0 0xf9e00000 0x0 0x2200000>;
+			no-map;
+		};
+
+		mblock-19-unmap2 {
+			reg = <0x3 0x3d800000 0x0 0x200000>;
+			no-map;
+		};
+
+		mblock-18-mkp {
+			reg = <0x3 0x3da00000 0x0 0x200000>;
+			no-map;
+		};
+
+		mblock-17-gz {
+			reg = <0x3 0x3dc00000 0x0 0x2200000>;
+			no-map;
+		};
+
+		mblock-16-me_cmdq_reserved {
+			reg = <0x3 0x3fe00000 0x0 0x100000>;
+			no-map;
+		};
+
+		mblock-14-me_gpu_reserved {
+			reg = <0x0 0x7f200000 0x0 0x200000>;
+			no-map;
+		};
+
+		mblock-13-security_dice_common {
+			reg = <0x0 0x6fffe000 0x0 0x1000>;
+			no-map;
+		};
+
+		mblock-12-atf-log-reserved {
+			reg = <0x0 0xbfe00000 0x0 0x200000>;
+			no-map;
+		};
+
+		mblock-10-emi_mbist_buf {
+			reg = <0x0 0x7ffff000 0x0 0x1000>;
+			no-map;
+		};
+
+		mblock-9-dramc-rk1 {
+			reg = <0x3 0x3fffe000 0x0 0x2000>;
+			no-map;
+		};
+
+		mblock-8-dramc-rk0 {
+			reg = <0x1 0xbfffe000 0x0 0x2000>;
+			no-map;
+		};
+
+		mblock-7-platform-debug_dfdmcu_dump {
+			reg = <0x0 0xf9800000 0x0 0x280000>;
+			no-map;
+		};
+
+		mblock-6-crypto_hw {
+			reg = <0x0 0x48401000 0x0 0x1000>;
+			no-map;
+		};
+
+		mblock-4-BL31-reserved {
+			reg = <0x0 0x48800000 0x0 0x200000>;
+			no-map;
+		};
+
+		mblock-3-minirdump {
+			reg = <0x0 0x48170000 0x0 0x10000>;
+			no-map;
+		};
+
+		mblock-1-aee_debug_kinfo {
+			reg = <0x0 0x48080000 0x0 0x10000>;
+			no-map;
+		};
+
+		/*
+		 * ramoops：把最后一次启动的 console 日志留在内存里。
+		 *
+		 * 尺寸必须与内核 cmdline 的 ramoops.* 参数一致，否则两个实例会打架：
+		 * 2026-09-17 实测发现内核**同时**创建了两个 ramoops 平台设备 ——
+		 *     /sys/bus/platform/devices/ramoops             <- cmdline 参数建的 dummy
+		 *     /sys/bus/platform/devices/48090000.ramoops    <- 本节点
+		 * 而只有 dummy 真正 probe 成功（本节点没有 driver），所以
+		 * **实际生效的是 cmdline 那套参数**，本节点目前是死节点。
+		 *
+		 * 历史事故：cmdline 曾用 mem_size=0x100000，比本节点保留区（0xe0000）
+		 * 多出 0x20000，写到了 0x4818ffff —— 覆盖 mblock-3-minirdump(no-map)
+		 * 与 64 KiB 未保留内核内存，pstore 记录也因此全部校验不过。
+		 * 已在 configs/tb375fc-s1.config 的 CONFIG_CMDLINE 里对齐为 0xe0000。
+		 *
+		 * 布局：record 0x20000 + console 0x40000 + pmsg 0x80000 = 0xe0000（刚好填满）
+		 *
+		 * 注意：这里**不能** no-map —— 它必须留在普通内存里才能跨重启存活。
+		 */
+		ramoops@48090000 {
+			compatible = "ramoops";
+			reg = <0x0 0x48090000 0x0 0xe0000>;
+			record-size = <0x20000>;
+			console-size = <0x40000>;
+			ftrace-size = <0x0>;
+			pmsg-size = <0x80000>;
+		};
+	};
+
+	/*
+	 * 把 stdout 接到 LK 的点亮画面上。放在根节点而不是 /chosen ——
+	 * LK 会重写 /chosen 并丢掉它不认识的属性（xaga 移植踩过这个坑）。
+	 */
+	framebuffer@fc16f000 {
+		compatible = "simple-framebuffer";
+		reg = <0x0 0xfc16f000 0x0 0x3e90000>;
+		width = <2944>;
+		height = <1840>;
+		stride = <11776>;		/* 2944 * 4 */
+		format = "a8r8g8b8";
+	};
+
+	backlight: backlight {
+		compatible = "pwm-backlight";
+		pwms = <&disp_pwm0 0 39380>;
+		brightness-levels = <
+			  0   1   2   3   4   5   6   7   8   9
+			 10  12  14  16  19  22  26  30  35  40
+			 46  53  60  68  77  87  98 110 123 137
+			152 168 185 203 222 242 255
+		>;
+		default-brightness-level = <20>;
+		status = "okay";
+	};
+};
+
+/*
+ * S1 先不开 UART：没有可用的调试口，而 uarthub 的路由主线没有驱动，
+ * 探错了反而可能把键盘底座的 UART 搞乱。留 status = "disabled"。
+ */
+&uart0 {
+	status = "disabled";
+};
+
+/*
+ * ★ 必须开看门狗。LK 起来时就把硬件 RGU 打开了，之后没人喂它就会复位 ——
+ *   这正是我们一直看到「卡一屏 → 重启」、以及 panic=0 也停不住的原因。
+ *   主线 mtk_wdt 驱动 probe 后会接管它；配合
+ *   CONFIG_WATCHDOG_HANDLE_BOOT_ENABLED，内核会自己喂，设备就不会再被复位，
+ *   panic 时的现场才能留在屏幕上。
+ */
+&watchdog {
+	status = "okay";
+};
+
+&ufsphy {
+	status = "okay";
+};
+
+&ufshci {
+	status = "okay";
+};
+
+&u2phy0 {
+	status = "okay";
+};
+
+&ssusb {
+	dr_mode = "peripheral";
+	status = "okay";
+};
+
+&xhci0 {
+	status = "disabled";
+};
+
+
+/*
+ * ★ 触摸：Novatek NT36532，走 SPI2。
+ * 没有 pinctrl 驱动前，引脚复用和电源由内核驱动里的硬编码 GPIO 初始化完成。
+ * IRQ 线是 GPIO 9（厂商 DTBO 实测值；此前误记为 59），无 pinctrl 描述时驱动
+ * fallback 到 100Hz 轮询。
+ *
+ * ★ SPI 模块时钟（2026-09-12 实测修正）：厂商 DTB 为 clock-source-type = "mainpll"，
+ * 用内部回环精确计时反推模块时钟 ≈ 208 MHz。主线暂无 MT6897 topckgen 驱动，
+ * dtsi 里三个时钟全写成 clk26m 占位（26 MHz），而驱动是按 clk_get_rate() 算分频的：
+ *     div = DIV_ROUND_UP(spi_clk_hz, speed_hz);  sck_time = (div + 1) / 2;
+ *     SCLK = f_mod / (2 * sck_time)
+ * 按 26 MHz 算 → div=3, sck_time=2 → CFG2=0x00010001（实测寄存器正是此值），
+ * 真实 SCLK = 208/4 ≈ 52 MHz，是 NT36532 上限 9.6 MHz 的 5.4 倍。
+ * 佐证：同一控制器内部回环在 CFG2=0x00010001 时数据被破坏（a5a5→b4b4），
+ *       在 CFG2=0x000a000a 时完全正确 —— 0x0a 正是 9.6 MHz 目标对应的取值。
+ *
+ * ★ spi-max-frequency = 1 MHz 是刻意保守值（loopback 验证过的安全档）：
+ * 208 MHz 是回环计时反推的估计值，非时钟树确证；按 1 MHz 请求即使 f_mod 有
+ * 数倍偏差，SCLK 仍远低于 NT36532 的 9.6 MHz 上限。代价只是传输慢（本阶段
+ * 已关闭 boot 固件升级，只传小包，无影响）。首触成功后再提到 9.6 MHz。
+ */
+/ {
+	spi_mclk: spi-mclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <208000000>;
+	};
+};
+
+&spi2 {
+	clocks = <&clk26m>, <&clk26m>, <&spi_mclk>;
+	clock-names = "parent-clk", "sel-clk", "spi-clk";
+	mediatek,pad-select = <0x00>;
+	mediatek,tickdly = <0x03 0x00>;
+	status = "okay";
+
+	touchscreen@0 {
+		compatible = "novatek,NVT-ts-spi";
+		reg = <0>;
+		spi-max-frequency = <9600000>;   /* = vendor DTBO 0x927c00 (9.6 MHz), NT36532 datasheet max */
+		novatek,reset-gpio = <&pio 60 GPIO_ACTIVE_HIGH>;
+		novatek,irq-gpio = <&pio 9 0x2001>;
+		novatek,pen-support;
+		novatek,stylus-resol-double;
+		novatek,accept-unknown-chip;
+		novatek,fw-name = "novatek_ts_fw_boe.bin";
+		novatek,mp-name = "novatek_ts_mp_boe.bin";
+		touchscreen-size-x = <1840>;
+		touchscreen-size-y = <2944>;
+		status = "okay";
+	};
+};
+
+&disp_pwm0 {
+	status = "okay";
+};
+
+
+
+/*
+ * ================= 电池（2026-09-12）=================
+ * 主线自带 mm8013 电量计驱动（drivers/power/supply/mm8013.c），
+ * 它是**按需读取**的：每次 power_supply 取属性时直接读寄存器，不需要中断。
+ * 所以只要 I2C 通，就能拿到 SOC / 电压 / 电流 / 温度 / 循环次数。
+ *
+ *   电量计  mm8013  @0x55  → i2c7 = 0x11d02000（厂商编号）
+ *   充电 IC mt6375  @0x34  → i2c5 = 0x11f01000（INT = GPIO7 低有效）
+ *
+ * 引脚复用：厂商 DT 里没有这两组 I2C 的 pinmux 组，推断由 LK 配置
+ * （LK 的充电流程本身就要用这两条总线）。若实测不通，再从 recovery 侧
+ * 读 GPIO147/148（i2c5）与 GPIO151/152（i2c7）的 MODE 寄存器补配。
+ */
+&i2c5 {
+	/* 厂商值是 1 MHz；先用 400 kHz 保守值（占位时钟偏大 ⇒ 实际只会更慢） */
+	clock-frequency = <400000>;
+	status = "okay";
+
+	/*
+	 * mt6375：外置充电 / SubPMIC（i2c5 @0x34，INT 本应是 GPIO7）。
+	 *
+	 * 2026-09-17 启用充电。此前保持 disabled 的原因：充电驱动的
+	 * init_irq() 拿不到中断会 probe 失败，而失败的 probe 中途可能动
+	 * Type-C 开关、切断 USB。现在处理为：
+	 *   - MFD 树内已支持 client->irq<=0（只建 irq domain，不请求中断）；
+	 *   - 充电驱动 init_irq() 由 patch_mt6375_charger_noirq.py 改成可跳过；
+	 *   - 故意**不给** interrupts / phys / usb / tcpc 子节点 —— 让 USB 开关
+	 *     (usbsw) 与 BC1.2 一条都不执行，USB 数据通路保持 LK 交出的状态；
+	 *   - VBUS 交给驱动自带的 vbus_check_work 每 2 秒轮询，attach 即开充。
+	 */
+	mt6375: charger@34 {
+		compatible = "mediatek,mt6375";
+		reg = <0x34>;
+		status = "okay";
+		interrupt-controller;
+		#interrupt-cells = <1>;
+
+		/*
+		 * MT6375 ADC（IIO）。充电驱动读 VBUS 必须走它：
+		 *   mt6375_get_vbus -> mt6375_get_adc -> iio_read_channel_processed
+		 * 没有它 iio_adcs=NULL ⇒ VBUS 恒读 0 ⇒ 永不 attach ⇒ 不充电。
+		 */
+		mt6375_adc: adc {
+			compatible = "mediatek,mt6375-adc";
+			#io-channel-cells = <1>;
+		};
+
+		chg {
+			compatible = "mediatek,mt6375-chg";
+			chg_name = "primary_chg";
+			aicr = <3000>;
+			mivr = <4400>;
+			cv = <4450>;
+			ichg = <2000>;
+			ieoc = <150>;
+			wdt = <40000>;
+			vbus_ov = <14500>;
+			vrec = <100>;
+			chg_tmr = <10>;
+			chg_tmr_en;
+			dcdt_sel = <600>;
+			/*
+			 * 顺序必须匹配 enum mt6375_adc_chan（charger 侧）：
+			 *   CHGVINDIV5, VSYS, VBAT, IBUS, IBAT, TEMP_JC, TS,
+			 *   USBDP, USBDM, (VREFTS)
+			 * 对应 ADC 的 .channel：1,3,4,5,6,8,10,2,7,9
+			 */
+			io-channels = <&mt6375_adc 1>,
+				      <&mt6375_adc 3>,
+				      <&mt6375_adc 4>,
+				      <&mt6375_adc 5>,
+				      <&mt6375_adc 6>,
+				      <&mt6375_adc 8>,
+				      <&mt6375_adc 10>,
+				      <&mt6375_adc 2>,
+				      <&mt6375_adc 7>,
+				      <&mt6375_adc 9>;
+			/* 无 interrupts：走 VBUS 轮询；无 phys/usb：不切 USB 开关 */
+		};
+	};
+};
+
+&i2c7 {
+	/* 100 kHz：MM8013 读不稳（高字节 0xFF）+ 设置闪退的修复。
+	 * 厂商 DTBO 里该总线也是低速（1MHz 偏快，实测 0xFF 填充）；
+	 * 降到 100 kHz 保证容性负载下数据可靠，后续若稳可回提。 */
+	clock-frequency = <100000>;
+	status = "okay";
+
+	ext_gauge: gauge@55 {
+		compatible = "mitsumi,mm8013";
+		reg = <0x55>;
+		status = "okay";
+	};
+};
+
+/* MT6363 PMIC（SPMI）：等 clk-mt6897 时钟驱动就位后再启用，
+   否则 PMIF 总线第一次访问就会把 CPU 挂死（2026-09-13 实测） */
+
+/*
+ * ================= GPU（Mali-G615 / panthor）— 第一阶段骨架 =================
+ * 目的：先让 panthor 绑定，实测它在 MT6897 上能 probe 到哪一步。
+ *
+ * 现状与依赖（诚实标注，分阶段做）：
+ *   - 时钟：暂时用 fixed-clock 占位。真正的 MFGPLL/MFG_SEL 需要 clk-mt6897，
+ *           尚未移植（参考树只有 clk-mt6895）。
+ *   - 电源：MT6375 充电已通，但 GPU 的 MFG MTCMOS(scpsys) / GPUEB 尚未接。
+ *           没有它们，GPU 可能根本没上电 ⇒ panthor 读 GPU_ID 会失败。
+ *   - 固件：panthor 从 arm/mali/archX.Y/mali_csffw.bin 取（rootfs 里是 .zst）。
+ *   - vdd_gpu：与 mt6895 参考一样用固定假稳压（LK 已把真轨打开）。
+ */
+/ {
+	vdd_gpu: regulator-gpu {
+		compatible = "regulator-fixed";
+		regulator-name = "vdd_gpu";
+		regulator-min-microvolt = <750000>;
+		regulator-max-microvolt = <750000>;
+		regulator-always-on;
+	};
+
+	gpu_core_clk: gpu-core-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <850000000>;
+	};
+
+	gpu_stacks_clk: gpu-stacks-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <850000000>;
+	};
+
+	gpu_opp_table: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		opp-850000000 {
+			opp-hz = /bits/ 64 <850000000>;
+			opp-microvolt = <750000>;
+		};
+
+		opp-700000000 {
+			opp-hz = /bits/ 64 <700000000>;
+			opp-microvolt = <750000>;
+		};
+	};
+};
+
+/*
+ * MT6897 gpusys（gpu_eb_rpc）电源控制器：MFG1..MFG14 的 MTCMOS 由它管。
+ * 数据反推自厂商 mtk-scpsys-mt6897.ko（base 0x13f91000）。
+ * ⚠ bp_table 暂留空（总线保护类型映射未定死），首次只验证电源域能否上电。
+ */
+&soc {
+	/* 厂商 DTB 里 scpsys/gpusys 用的 5 个总线保护 syscon（地址取自厂商 DTB） */
+	ifr_bus: syscon@1002c000 {
+		compatible = "mediatek,mt6897-ifr_bus", "syscon";
+		reg = <0x0 0x1002c000 0x0 0x1000>;
+	};
+	nemi_bus: syscon@10270000 {
+		compatible = "mediatek,mt6897-nemi_bus", "syscon";
+		reg = <0x0 0x10270000 0x0 0x1000>;
+	};
+	semi_bus: syscon@1030e000 {
+		compatible = "mediatek,mt6897-semi_bus", "syscon";
+		reg = <0x0 0x1030e000 0x0 0x1000>;
+	};
+	vlpcfg_bus: syscon@1c00c000 {
+		compatible = "mediatek,mt6897-vlpcfg_bus", "syscon";
+		reg = <0x0 0x1c00c000 0x0 0x1000>;
+	};
+
+	/* ========================================================================
+	 * SPMI 总线 + MT6363/MT6368 PMIC —— 目的是给 connsys 提供 5 路射频电源
+	 * ========================================================================
+	 * 需求来源：conninfra/platform/mt6897/mt6897_pmic.c 用标准 regulator 框架，
+	 * 从 **consys 设备**上按名字取 5 路（见下面 &consys 的 *-supply）：
+	 *     mt6363_vcn13（optional+notifier） / mt6363_vrfio18（必需）
+	 *     mt6368_vcn33_1 / mt6368_vcn33_2 / mt6368_vant18
+	 * 参考移植（xaga/MT6895）已把整条链在主线跑通，这里照它的结构落到 MT6897。
+	 *
+	 * SPMI 地址/reg-names 取自 live FDT（LK 传入的那份 board.dtb）：
+	 *     pmif@1cc04000 / spmimst@1cc01000 / pmif-p@1cc06000 / spmimst-p@1cc00000
+	 * 驱动的 of_match 里已经有 "mediatek,mt6897-spmi"（复用 mt6895_pmif_arb）。
+	 *
+	 * ⚠️ 时钟必需：spmi-mtk-pmif 对 pmif_sys_ck / pmif_tmr_ck / spmimst_clk_mux
+	 *    三个时钟是 of_clk_get_by_name + 缺一个就 dev_err_probe 返回。
+	 *    真正的源是 vlp_cksys 的 pmif mux/gate（0x1c013000），LK 为了跟 PMIC
+	 *    通信已经开好；这里用 fixed-clock 桩只是为了满足 clk_bulk_get。
+	 *
+	 * ⚠️ 刻意不写 interrupts-extended：MT6897 的 vivo FDT 编码与我们的
+	 *    4-cell GIC 对不上（无法可靠解码），而参考移植已经把 mtk_spmi_irq_init
+	 *    改成**无中断可降级**（"降级为无中断模式继续工作，PMIC 侧自会走轮询"）。
+	 *    我们只需要 regulator 寄存器访问，不需要 PMIC 中断 ⇒ 先不接。
+	 */
+	clk_pmif_sys: clock-pmif-sys {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <26000000>;
+		clock-output-names = "pmif-sys";
+	};
+
+	clk_pmif_tmr: clock-pmif-tmr {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <26000000>;
+		clock-output-names = "pmif-tmr";
+	};
+
+	clk_spmimst: clock-spmimst-mux {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <26000000>;
+		clock-output-names = "spmimst-mux";
+	};
+
+	spmi: spmi@1cc04000 {
+		compatible = "mediatek,mt6897-spmi";
+		reg = <0x0 0x1cc04000 0x0 0x8ff>,
+		      <0x0 0x1cc01000 0x0 0x100>,
+		      <0x0 0x1cc06000 0x0 0x8ff>,
+		      <0x0 0x1cc00000 0x0 0x100>;
+		reg-names = "pmif", "spmimst", "pmif-p", "spmimst-p";
+		clocks = <&clk_pmif_sys>, <&clk_pmif_tmr>, <&clk_spmimst>;
+		clock-names = "pmif_sys_ck", "pmif_tmr_ck", "spmimst_clk_mux";
+		#address-cells = <2>;
+		#size-cells = <0>;
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		status = "okay";
+
+		/*
+		 * MT6363（主 PMIC，SPMI 从地址 4）。
+		 * 用的容器 compatible 是 **mediatek,mt6363-regulator-mt6895**
+		 * —— 那是参考移植落在 drivers/regulator/mt6363-mt6895.c 的驱动，
+		 * 匹配串就写死了 mt6895。MT6363 是同一颗 PMIC、寄存器一致，
+		 * 所以 MT6897 直接复用（Kconfig: CONFIG_REGULATOR_MT6363 会同时
+		 * 编出 mt6363-regulator.o 和 mt6363-mt6895.o）。
+		 * 电参数照 live FDT 原值。
+		 */
+		mt6363: pmic@4 {
+			compatible = "mediatek,mt6363";
+			reg = <4 0>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+
+			regulators {
+				compatible = "mediatek,mt6363-regulator-mt6895";
+
+				mt6363_vcn13: VCN13 {
+					regulator-compatible = "VCN13";
+					regulator-name = "mt6363_vcn13";
+					regulator-min-microvolt = <0xdbba0>;
+					regulator-max-microvolt = <0x1b9e50>;
+					regulator-enable-ramp-delay = <0xb4>;
+					regulator-allowed-modes = <0 2>;
+				};
+
+				mt6363_vrfio18: VRFIO18 {
+					regulator-compatible = "VRFIO18";
+					regulator-name = "mt6363_vrfio18";
+					regulator-min-microvolt = <0x927c0>;
+					regulator-max-microvolt = <0x200b20>;
+					regulator-enable-ramp-delay = <0xb4>;
+					regulator-allowed-modes = <0 2>;
+				};
+			};
+
+			mt6363_consys: mt6363-consys {
+				compatible = "mediatek,mt6363-consys";
+			};
+		};
+
+		/*
+		 * MT6368（第二 PMIC，SPMI 从地址 5）。
+		 * ⚠️ 容器**必须**写 compatible = "mediatek,mt6368-regulator"：
+		 *    参考移植的 mt6895.dtsi 里这个容器漏了 compatible（那边没用到
+		 *    MT6368 的轨），而 mtk-spmi-pmic 的子设备是靠
+		 *    devm_of_platform_populate() 按 compatible 匹配驱动的，
+		 *    漏了就永远绑不上。
+		 */
+		mt6368: second_pmic@5 {
+			compatible = "mediatek,mt6368";
+			reg = <5 0>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+
+			regulators {
+				compatible = "mediatek,mt6368-regulator";
+
+				mt6368_vant18: VANT18 {
+					regulator-compatible = "VANT18";
+					regulator-name = "mt6368_vant18";
+					regulator-min-microvolt = <0x927c0>;
+					regulator-max-microvolt = <0x200b20>;
+					regulator-enable-ramp-delay = <0x2a8>;
+					regulator-allowed-modes = <0 2>;
+				};
+
+				mt6368_vcn33_1: VCN33_1 {
+					regulator-compatible = "VCN33_1";
+					regulator-name = "mt6368_vcn33_1";
+					regulator-min-microvolt = <0x124f80>;
+					regulator-max-microvolt = <0x3567e0>;
+					regulator-enable-ramp-delay = <0x2a8>;
+					regulator-allowed-modes = <0 2>;
+				};
+
+				mt6368_vcn33_2: VCN33_2 {
+					regulator-compatible = "VCN33_2";
+					regulator-name = "mt6368_vcn33_2";
+					regulator-min-microvolt = <0x124f80>;
+					regulator-max-microvolt = <0x3567e0>;
+					regulator-enable-ramp-delay = <0x2a8>;
+					regulator-allowed-modes = <0 2>;
+				};
+			};
+
+			mt6368_consys: mt6368-consys {
+				compatible = "mediatek,mt6368-consys";
+			};
+		};
+
+		/* MT6685 时钟伴随芯片（SPMI 从地址 9） */
+		mt6685_mfd: mt6685_mfd {
+			compatible = "mediatek,mt6685";
+			reg = <0x09 0x00>;
+
+			mt6685_consys: mt6685-consys {
+				compatible = "mediatek,mt6685-consys";
+			};
+		};
+	};
+
+	/* 单独的 syscon 视图，供 scpsys 的 bp_regmap 用（厂商的 gpu-eb-rpc 总线） */
+	gpu_eb_rpc: syscon@13f91000 {
+		compatible = "mediatek,mt6897-gpu_eb_rpc_bus", "syscon";
+		reg = <0x0 0x13f91000 0x0 0x1000>;
+	};
+
+	/*
+	 * MT6897 SPM 电源域（power-controller@1c001000）。
+	 *
+	 * 节点本体在 mt6897.dtsi（`scpsys: syscon@1c001000`，
+	 * compatible = "mediatek,mt6897-scpsys", "syscon"），这里只是补属性。
+	 *
+	 * 数据反推自厂商 mtk-scpsys-mt6897.ko + mtk-scpsys.ko，
+	 * 见 reports/20260918-wifi-bt-bringup-status.md §8 与 ref/mt6897-scpsys-domains.json。
+	 * 当前只实现了 **conn** 域（connsys 的 MTCMOS，WiFi/蓝牙/GNSS 用）。
+	 *
+	 * ⚠️ 属性名必须用**主线**的。厂商 core（mtk-scpsys.ko）用的是它自己那套
+	 *    dash 命名（ifr-bus / nemi-bus / semi-bus / gpu-eb-rpc / vlpcfg），
+	 *    而主线 init_scp() 查的是 infracfg / smi_comm / vlpcfg / mfgrpc /
+	 *    nemi_bus / semi_bus。映射关系（厂商 bus_list 下标即 bp.type）：
+	 *
+	 *      bp.type=1 "gpu-eb-rpc" @0x13f91000 → 主线 MFGRPC_TYPE → mfgrpc
+	 *      bp.type=2 "ifr-bus"    @0x1002c000 → 主线 IFR_TYPE    → infracfg
+	 *      bp.type=3 "vlpcfg"     @0x1c00c000 → 主线 VLP_TYPE    → vlpcfg
+	 *      bp.type=4 "nemi-bus"   @0x10270000 → 主线 NEMI_TYPE   → nemi_bus
+	 *      bp.type=5 "semi-bus"   @0x1030e000 → 主线 SEMI_TYPE   → semi_bus
+	 *
+	 *    conn 的 4 条总线保护条目全部 type=2 ⇒ 全部落在 infracfg(=ifr_bus)。
+	 *    smi_comm 主线里是可选的（-ENODEV 容忍），conn 用不到，故不提供。
+	 */
+
+	gpusys: power-controller@13f91000 {
+		compatible = "mediatek,mt6897-gpusys";
+		reg = <0x0 0x13f91000 0x0 0x1000>;
+		#power-domain-cells = <1>;
+		/*
+		 * 主线的 mtk-scpsys.c 用固定属性名 + 全局枚举
+		 * （IFR=1/SMI=2/VLP=3/MFGRPC=4/NEMI=5/SEMI=6）。
+		 * 这里把厂商的 5 个总线映射过去：
+		 *   infracfg  <- ifr_bus(0x1002c000)
+		 *   smi_comm  <- gpusys 自己(0x13f91000)   [厂商的 gpu-eb-rpc 总线]
+		 *   nemi_bus  <- nemi_bus(0x10270000)
+		 *   semi_bus  <- semi_bus(0x1030e000)
+		 *   vlpcfg    <- vlpcfg_bus(0x1c00c000)
+		 *   mfgrpc    <- gpusys 自己
+		 */
+		infracfg = <&ifr_bus>;
+		smi_comm = <&gpu_eb_rpc>;
+		nemi_bus = <&nemi_bus>;
+		semi_bus = <&semi_bus>;
+		vlpcfg = <&vlpcfg_bus>;
+		mfgrpc = <&gpu_eb_rpc>;
+		/*
+		 * ⚠️ 2026-09-18 关闭：这个域的 power-on 序列会硬锁死 SoC，
+		 * 现象是"卡在 boot logo（8 企鹅）、无 USB/COM/ping"。见
+		 * reports/fixes/20260917-gpu-panthor-bringup-status.md §8.7。
+		 * 对应的 CONFIG_MTK_SCPSYS_MT6897_GPUSYS 也一并关掉（少了它，
+		 * 这个节点即使 okay 也匹配不到驱动，但显式 disabled 更不容易误导）。
+		 */
+		status = "disabled";
+	};
+};
+
+/*
+ * MT6897 SPM 电源域（节点本体在 mt6897.dtsi 的 `scpsys: syscon@1c001000`）。
+ * 这里补上主线 init_scp() 需要的 syscon 引用；映射依据见上面 &soc 里那段注释。
+ *
+ * 只实现了 conn 一个域（connsys MTCMOS）。驱动 `mtk-scpsys-mt6897.c` 由
+ * tools/patches/add_scpsys_mt6897_spm.py 安装，开关 CONFIG_MTK_SCPSYS_MT6897。
+ *
+ * ⚠️ 探测不碰硬件：conn 带 BYPASS_INIT_ON ⇒ 注册时不会 power_on（is_off=true），
+ *    没有消费者时也不会被 late_init 关掉。只有真的挂上 power-domains
+ *    的消费者（将来打开连接性时的 consys）才会走加电序列。
+ */
+&scpsys {
+	infracfg = <&ifr_bus>;
+	vlpcfg = <&vlpcfg_bus>;
+	mfgrpc = <&gpu_eb_rpc>;
+	nemi_bus = <&nemi_bus>;
+	semi_bus = <&semi_bus>;
+	status = "okay";
+};
+
+&gpu {
+	status = "okay";
+	/*
+	 * 与 MT6895 参考树一致：core/coregroup/stacks（coregroup = mfgcfg BG3D
+	 * gate，必须由驱动持有，否则被 clk_disable_unused 关掉 → SError）。
+	 * 供电走 MFG bring-up（AOC/HWDCM/ACP/GPM），不再用 gpusys genpd。
+	 */
+	clocks = <&mfg_ref_ck>, <&mfgcfg 0>, <&mfg_ref_ck>;
+	clock-names = "core", "coregroup", "stacks";
+	mali-supply = <&vdd_gpu>;
+	operating-points-v2 = <&gpu_opp_table>;
+};
+
+/*
+ * ============================================================================
+ * MT6897 连接性（WiFi / 蓝牙 / GNSS）—— conninfra + connfem
+ * ============================================================================
+ * 节点本体在 mt6897.dtsi（默认 disabled，与厂商 DTB 逐字对齐）。
+ * 依据：tools/vendor-forensics/vendor_base.dts:14038-14151。
+ *
+ * ⚠️⚠️ 2026-09-18：**这四个节点暂时保持 disabled，不要打开。**
+ * 打开（并同时把 CONFIG_MTK_COMBO 打开）会让 connsys 的加电序列硬锁死 SoC：
+ * 现象是卡在 boot logo（8 只企鹅）、无 USB/COM/ping，只能人工按键进 fastboot 救回来。
+ * 已实测：连接性编入 + 节点 okay ⇒ 挂；连接性不编 ⇒ 正常。
+ * 依赖清单（CONN 电源域 / 5 路 PMIC 稳压 / EMI 保留内存 / BTIF 时钟）见
+ * reports/20260918-wifi-bt-bringup-status.md。
+ *
+ * 将来打开时，厂商 DTB 里还有三样东西主线**故意不抄**，原因逐条列出：
+ *   1. power-domains = <&scpsys MT6897_POWER_DOMAIN_CONN>
+ *      —— 主线的 MT6897 scpsys 只做了 GPU 那半边（见上面 gpusys 节点），
+ *      没有 CONN 电源域。写了也解析不到 genpd，反而 probe 直接 -EPROBE_DEFER 死锁。
+ *   2. pinctrl-0/1/2 = conninfra-pins-default / -tcxo-set / -tcxo-clr
+ *      —— 属于 pinnctrl-mt6897，主线还没有这颗 SoC 的 pinctrl 驱动。
+ *      conninfra 里 pinctrl 是可选路径，缺了走裸寄存器（与 MT6895 参考树一致）。
+ *   3. connfem 的 6 组 pinctrl-*  同上。
+ *
+ * ⚠️ emi-addr / emi-size 照抄厂商（=0 表示由 LK/ATF 在运行时注入地址）。
+ * 若 conninfra 报 EMI 相关错误，改成自己保留一块 reserved-memory。
+ */
+&consys {
+	/*
+	 * ★ 2026-09-18：打开。四个依赖里 #1（CONN 电源域）、#2（EMI）、
+	 *   #3（SPMI/PMIC 稳压）都已在设备上实测通过。
+	 * power-domains 指向本驱动唯一注册的域 —— mtk-scpsys-mt6897.c 里
+	 *   conn 是数组第 0 项（厂商表里是第 1 项，这里只实现了它一个）。
+	 *   conn 带 BYPASS_INIT_ON，注册时不加电；一旦这里挂上消费者，
+	 *   genpd 就会在 probe 前调 scpsys_power_on() 走厂商那套
+	 *   MTCMOS + ifr-bus 总线保护序列（数据全部反推自厂商 .ko）。
+	 */
+	status = "okay";
+	power-domains = <&scpsys 0>;
+	/* conninfra 的 emi_mng.c 靠它取 EMI 基址（本机 LK 没给 emi-addr）。 */
+	memory-region = <&consys_reserved>;
+	/*
+	 * conninfra/platform/mt6897/mt6897_pmic.c 要求从 **consys 设备**上
+	 * 按这些名字取电源（devm_regulator_get* 会去找 <name>-supply）。
+	 * 提供者见上面的 spmi@1cc04000 → mt6363/mt6368 两个 PMIC 的 regulators。
+	 */
+	mt6363_vcn13-supply = <&mt6363_vcn13>;
+	mt6363_vrfio18-supply = <&mt6363_vrfio18>;
+	mt6368_vcn33_1-supply = <&mt6368_vcn33_1>;
+	mt6368_vcn33_2-supply = <&mt6368_vcn33_2>;
+	mt6368_vant18-supply = <&mt6368_vant18>;
+};
+
+&wifi {
+	status = "okay";
+	/* wlan AXI 驱动（axi.c）从 "mediatek,wifi" 节点读 memory-region。 */
+	memory-region = <&wifi_reserved>;
+	/*
+	 * ★ 也挂 conn 电源域：axi_probe 会**立刻**访问 0x18000000 的 WLAN CSR，
+	 * 而 platform probe 是（可并行的）device_initcall —— 不能指望 consys
+	 * 一定先 probe 完。挂上 power-domains 后，genpd 会在 wifi probe **之前**
+	 * 就把 conn MTCMOS 拉起来，杜绝"访问未上电域 ⇒ 总线停摆"。
+	 */
+	power-domains = <&scpsys 0>;
+};
+
+&bt {
+	status = "okay";
+};
+
+&connfem {
+	status = "okay";
+	/* 同理：connfem 也住在 0x18000000 那片，先确保 conn 域已上电。 */
+	power-domains = <&scpsys 0>;
+};

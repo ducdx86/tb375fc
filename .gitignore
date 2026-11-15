@@ -1,0 +1,25 @@
+# Build outputs
+  *.bin
+  *.img
+  *.dtb
+  *.elf
+  *.o
+  *.ko
+  build/
+  output/
+  out/
+
+  # Toolchain / cache
+  *.cache
+  ccache/
+  .clangd/
+
+  # IDE
+  .vscode/
+  .idea/
+  *.swp
+  *~
+
+  # OS
+  .DS_Store
+  Thumbs.db
